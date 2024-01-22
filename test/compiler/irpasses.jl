@@ -1562,7 +1562,7 @@ function persistent_dict_elim_multiple()
 end
 @test_broken fully_eliminated(persistent_dict_elim_multiple)
 let code = code_typed(persistent_dict_elim_multiple)[1][1].code
-    @test count(x->isexpr(x, :invoke), code) == 0
+    @test_broken count(x->isexpr(x, :invoke), code) == 0
     @test code[end] == Core.ReturnNode(1)
 end
 
@@ -1780,4 +1780,38 @@ let code = Any[
     @test Core.Compiler.verify_ir(ir) === nothing
     @test !any(iscall((ir, getfield)), ir.stmts.stmt)
     @test length(ir.cfg.blocks[end].stmts) == 1
+end
+
+# JuliaLang/julia#52991: statements that may not :terminate should not be deleted
+@noinline Base.@assume_effects :effect_free :nothrow function issue52991(n)
+    local s = 0
+    try
+        while true
+            yield()
+            if n - rand(1:10) > 0
+                s += 1
+            else
+                break
+            end
+        end
+    catch
+    end
+    return s
+end
+@test !Core.Compiler.is_removable_if_unused(Base.infer_effects(issue52991, (Int,)))
+let src = code_typed1(issue52991, (Int,))
+    @test count(isinvoke(:issue52991), src.code) == 0
+end
+let t = @async begin
+        issue52991(11) # this call never terminates
+        nothing
+    end
+    sleep(1)
+    if istaskdone(t)
+        ok = false
+    else
+        ok = true
+        schedule(t, InterruptException(); error=true)
+    end
+    @test ok
 end
