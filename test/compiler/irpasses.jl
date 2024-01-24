@@ -1815,3 +1815,11 @@ let t = @async begin
     end
     @test ok
 end
+
+# JuliaLang/julia47664
+@test !fully_eliminated() do
+    any(isone, Iterators.repeated(0))
+end
+@test !fully_eliminated() do
+    all(iszero, Iterators.repeated(0))
+end
