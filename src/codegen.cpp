@@ -2771,7 +2771,6 @@ static std::pair<bool, bool> uses_specsig(jl_method_instance_t *lam, jl_value_t 
     return std::make_pair(uses_specsig(sig, needsparams, va, rettype, prefer_specsig), needsparams);
 }
 
-
 // Logging for code coverage and memory allocation
 
 JL_DLLEXPORT void jl_coverage_alloc_line(StringRef filename, int line);
@@ -6477,8 +6476,9 @@ static void allocate_gc_frame(jl_codectx_t &ctx, BasicBlock *b0, bool or_new=fal
     // allocate a placeholder gc instruction
     // this will require the runtime, but it gets deleted later if unused
     ctx.topalloca = ctx.builder.CreateCall(prepare_call(or_new ? jladoptthread_func : jlpgcstack_func));
-    ctx.pgcstack = ctx.topalloca;
-    ctx.pgcstack->setName("pgcstack");
+    ctx.topalloca->setName("pgcstack");
+    if (ctx.pgcstack == nullptr)
+        ctx.pgcstack = ctx.topalloca;
 }
 
 static Value *get_current_task(jl_codectx_t &ctx)
@@ -6511,6 +6511,50 @@ static Value *get_scope_field(jl_codectx_t &ctx)
             ctx.builder.CreateBitCast(ct, ctx.types().T_prjlvalue->getPointerTo()),
             ConstantInt::get(ctx.types().T_size, offsetof(jl_task_t, scope) / ctx.types().sizeof_ptr),
             "current_scope");
+}
+
+static Function *emit_modifyhelper(jl_codectx_t &ctx2, const jl_cgval_t &cmp, const jl_cgval_t &modifyop, jl_value_t *jltype, Type *elty, const Twine &fname, bool gcstack_arg)
+{
+    Module *M = ctx2.f->getParent();
+    jl_codectx_t ctx(M->getContext(), ctx2.emission_context, ctx2.min_world, ctx2.max_world);
+    FunctionType *FT = FunctionType::get(elty, {elty, elty}, false);
+    if (gcstack_arg)
+        FT = FunctionType::get(elty, {PointerType::get(JuliaType::get_ppjlvalue_ty(ctx.builder.getContext()), 0), elty, elty}, false);
+    Function *w = Function::Create(FT, GlobalVariable::PrivateLinkage, "", M);
+    jl_init_function(w, ctx.emission_context.TargetTriple);
+    w->addFnAttr(Attribute::AlwaysInline);
+    w->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    Function::arg_iterator AI = w->arg_begin();
+    if (gcstack_arg) {
+        w->setCallingConv(CallingConv::Swift);
+        AttrBuilder param(ctx.builder.getContext());
+        param.addAttribute(Attribute::SwiftSelf);
+        param.addAttribute(Attribute::NonNull);
+        Argument *gcstackarg = &*AI++;
+        gcstackarg->addAttrs(param);
+        gcstackarg->setName("pgcstack_arg");
+        ctx.pgcstack = gcstackarg;
+    }
+    Argument *A = &*AI++;
+    Argument *B = &*AI++;
+    assert(AI == w->arg_end());
+    ctx.f = w;
+    ctx.rettype = jltype;
+    BasicBlock *b0 = BasicBlock::Create(ctx.builder.getContext(), "top", w);
+    ctx.builder.SetInsertPoint(b0);
+    DebugLoc noDbg;
+    ctx.builder.SetCurrentDebugLocation(noDbg);
+    allocate_gc_frame(ctx, b0);
+    const jl_cgval_t argv[3] = { cmp, mark_julia_type(ctx, A, false, jltype), mark_julia_type(ctx, B, false, jltype) };
+    jl_cgval_t ret = emit_invoke(ctx, modifyop, argv, 3, (jl_value_t*)jl_any_type);
+    emit_typecheck(ctx, ret, jltype, fname);
+    ret = update_julia_type(ctx, ret, jltype);
+    ctx.builder.CreateRet(emit_unbox(ctx, elty, ret, jltype));
+    if (ctx.topalloca->use_empty()) {
+      ctx.topalloca->eraseFromParent();
+      ctx.topalloca = nullptr;
+    }
+    return w;
 }
 
 static Function *emit_tojlinvoke(jl_code_instance_t *codeinst, Module *M, jl_codegen_params_t &params)
@@ -6575,16 +6619,16 @@ static void emit_cfunc_invalidate(
     ctx.builder.SetInsertPoint(b0);
     DebugLoc noDbg;
     ctx.builder.SetCurrentDebugLocation(noDbg);
-    allocate_gc_frame(ctx, b0);
     Function::arg_iterator AI = gf_thunk->arg_begin();
     SmallVector<jl_cgval_t, 0> myargs(nargs);
     if (cc == jl_returninfo_t::SRet || cc == jl_returninfo_t::Union)
         ++AI;
     if (return_roots)
         ++AI;
-    if (JL_FEAT_TEST(ctx,gcstack_arg)){
-        ++AI; // gcstack_arg
+    if (JL_FEAT_TEST(ctx,gcstack_arg)) {
+        ctx.pgcstack = ++AI;
     }
+    allocate_gc_frame(ctx, b0);
     for (size_t i = 0; i < nargs; i++) {
         jl_value_t *jt = jl_nth_slot_type(calltype, i);
         // n.b. specTypes is required to be a datatype by construction for specsig
@@ -6670,6 +6714,10 @@ static void emit_cfunc_invalidate(
         ctx.builder.CreateRet(gf_retval);
         break;
     }
+    }
+    if (ctx.topalloca->use_empty()) {
+      ctx.topalloca->eraseFromParent();
+      ctx.topalloca = nullptr;
     }
 }
 
@@ -7608,6 +7656,10 @@ static Function *gen_invoke_wrapper(jl_method_instance_t *lam, jl_value_t *jlret
         }
     }
     ctx.builder.CreateRet(boxed(ctx, retval));
+    if (ctx.topalloca->use_empty()) {
+      ctx.topalloca->eraseFromParent();
+      ctx.topalloca = nullptr;
+    }
     return w;
 }
 
@@ -7700,7 +7752,7 @@ static jl_returninfo_t get_specsig_function(jl_codectx_t &ctx, Module *M, Value 
         argnames.push_back("return_roots");
     }
 
-    if (gcstack_arg){
+    if (gcstack_arg) {
         AttrBuilder param(ctx.builder.getContext());
         param.addAttribute(Attribute::SwiftSelf);
         param.addAttribute(Attribute::NonNull);
@@ -8255,7 +8307,51 @@ static jl_llvm_functions_t
             ctx.spvals_ptr = &*AI++;
         }
     }
-    // step 6. set up GC frame
+
+    // step 6. set up GC frame and special arguments
+    Function::arg_iterator AI = f->arg_begin();
+    SmallVector<AttributeSet, 0> attrs(f->arg_size()); // function declaration attributes
+
+    if (has_sret) {
+        Argument *Arg = &*AI;
+        ++AI;
+        AttrBuilder param(ctx.builder.getContext(), f->getAttributes().getParamAttrs(Arg->getArgNo()));
+        if (returninfo.cc == jl_returninfo_t::Union) {
+            param.addAttribute(Attribute::NonNull);
+            // The `dereferenceable` below does not imply `nonnull` for non addrspace(0) pointers.
+            param.addDereferenceableAttr(returninfo.union_bytes);
+            param.addAlignmentAttr(returninfo.union_align);
+        }
+        else {
+            const DataLayout &DL = jl_Module->getDataLayout();
+            Type *RT = Arg->getParamStructRetType();
+            TypeSize sz = DL.getTypeAllocSize(RT);
+            Align al = DL.getPrefTypeAlign(RT);
+            param.addAttribute(Attribute::NonNull);
+            // The `dereferenceable` below does not imply `nonnull` for non addrspace(0) pointers.
+            param.addDereferenceableAttr(sz);
+            param.addAlignmentAttr(al);
+        }
+        attrs[Arg->getArgNo()] = AttributeSet::get(Arg->getContext(), param); // function declaration attributes
+    }
+    if (returninfo.return_roots) {
+        Argument *Arg = &*AI;
+        ++AI;
+        AttrBuilder param(ctx.builder.getContext(), f->getAttributes().getParamAttrs(Arg->getArgNo()));
+        param.addAttribute(Attribute::NonNull);
+        // The `dereferenceable` below does not imply `nonnull` for non addrspace(0) pointers.
+        size_t size = returninfo.return_roots * sizeof(jl_value_t*);
+        param.addDereferenceableAttr(size);
+        param.addAlignmentAttr(Align(sizeof(jl_value_t*)));
+        attrs[Arg->getArgNo()] = AttributeSet::get(Arg->getContext(), param); // function declaration attributes
+    }
+    if (specsig && JL_FEAT_TEST(ctx, gcstack_arg)) {
+        Argument *Arg = &*AI;
+        ++AI;
+        AttrBuilder param(ctx.builder.getContext());
+        attrs[Arg->getArgNo()] = AttributeSet::get(Arg->getContext(), param);
+        ctx.pgcstack = Arg;
+    }
     allocate_gc_frame(ctx, b0);
     Value *last_age = NULL;
     Value *world_age_field = get_last_age_field(ctx);
@@ -8408,9 +8504,6 @@ static jl_llvm_functions_t
     }
 
     // step 8. move args into local variables
-    Function::arg_iterator AI = f->arg_begin();
-    SmallVector<AttributeSet, 0> attrs(f->arg_size()); // function declaration attributes
-
     auto get_specsig_arg = [&](jl_value_t *argType, Type *llvmArgType, bool isboxed) {
         if (type_is_ghost(llvmArgType)) { // this argument is not actually passed
             return ghostValue(ctx, argType);
@@ -8437,45 +8530,6 @@ static jl_llvm_functions_t
         return theArg;
     };
 
-    if (has_sret) {
-        Argument *Arg = &*AI;
-        ++AI;
-        AttrBuilder param(ctx.builder.getContext(), f->getAttributes().getParamAttrs(Arg->getArgNo()));
-        if (returninfo.cc == jl_returninfo_t::Union) {
-            param.addAttribute(Attribute::NonNull);
-            // The `dereferenceable` below does not imply `nonnull` for non addrspace(0) pointers.
-            param.addDereferenceableAttr(returninfo.union_bytes);
-            param.addAlignmentAttr(returninfo.union_align);
-        }
-        else {
-            const DataLayout &DL = jl_Module->getDataLayout();
-            Type *RT = Arg->getParamStructRetType();
-            TypeSize sz = DL.getTypeAllocSize(RT);
-            Align al = DL.getPrefTypeAlign(RT);
-            param.addAttribute(Attribute::NonNull);
-            // The `dereferenceable` below does not imply `nonnull` for non addrspace(0) pointers.
-            param.addDereferenceableAttr(sz);
-            param.addAlignmentAttr(al);
-        }
-        attrs[Arg->getArgNo()] = AttributeSet::get(Arg->getContext(), param); // function declaration attributes
-    }
-    if (returninfo.return_roots) {
-        Argument *Arg = &*AI;
-        ++AI;
-        AttrBuilder param(ctx.builder.getContext(), f->getAttributes().getParamAttrs(Arg->getArgNo()));
-        param.addAttribute(Attribute::NonNull);
-        // The `dereferenceable` below does not imply `nonnull` for non addrspace(0) pointers.
-        size_t size = returninfo.return_roots * sizeof(jl_value_t*);
-        param.addDereferenceableAttr(size);
-        param.addAlignmentAttr(Align(sizeof(jl_value_t*)));
-        attrs[Arg->getArgNo()] = AttributeSet::get(Arg->getContext(), param); // function declaration attributes
-    }
-    if (specsig && JL_FEAT_TEST(ctx, gcstack_arg)){
-        Argument *Arg = &*AI;
-        ++AI;
-        AttrBuilder param(ctx.builder.getContext());
-        attrs[Arg->getArgNo()] = AttributeSet::get(Arg->getContext(), param);
-    }
     for (i = 0; i < nreq; i++) {
         jl_sym_t *s = slot_symbol(ctx, i);
         jl_value_t *argType = jl_nth_slot_type(lam->specTypes, i);
@@ -9444,6 +9498,11 @@ static jl_llvm_functions_t
                 restTuple->eraseFromParent();
             }
         }
+    }
+
+    if (ctx.topalloca->use_empty()) {
+      ctx.topalloca->eraseFromParent();
+      ctx.topalloca = nullptr;
     }
 
     // link the dependent llvmcall modules, but switch their function's linkage to internal
