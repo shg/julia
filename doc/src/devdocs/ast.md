@@ -844,3 +844,8 @@ end
       depth also might have changed, though most callers should ignore that.
     - (zero, non-zero, *) : no line number, just edges (usually because of macro-expansion into
       top-level code)
+
+   `Core.Compiler` has a bunch of utility types and functions for handling this data.
+   The `Core.Compiler.DebugCodeLoc` object represents the 3 values. And there's a handy
+   utility function, `Core.Compiler.getdebugidx(debuginfo::Union{Core.DebugInfo,Core.Compiler.DebugInfoStream}, idx::Int)`,
+   that gives you the `DebugCodeLoc` matching a specific statement index (`idx`).
